@@ -37,11 +37,7 @@ const DEFAULT_RETRY_OPTIONS: Required<RetryOptions> = {
  * @param maxDelayMs - Maximum delay in milliseconds
  * @returns Delay in milliseconds
  */
-function calculateBackoffDelay(
-  attempt: number,
-  baseDelayMs: number,
-  maxDelayMs: number
-): number {
+function calculateBackoffDelay(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
   const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
   const jitteredDelay = exponentialDelay * Math.random();
   return Math.min(maxDelayMs, jitteredDelay);
@@ -76,10 +72,7 @@ function isRetryableError(err: unknown, retryableStatusCodes: number[]): boolean
  * @returns Promise result from fn
  * @throws Original error with retryExhausted: true if all retries fail
  */
-export async function withRetry<T>(
-  fn: () => Promise<T>,
-  options: RetryOptions = {}
-): Promise<T> {
+export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const config = { ...DEFAULT_RETRY_OPTIONS, ...options };
 
   let lastError: any;
@@ -100,11 +93,7 @@ export async function withRetry<T>(
         throw err;
       }
 
-      const delayMs = calculateBackoffDelay(
-        attempt,
-        config.baseDelayMs,
-        config.maxDelayMs
-      );
+      const delayMs = calculateBackoffDelay(attempt, config.baseDelayMs, config.maxDelayMs);
 
       const statusCode = (err as any)?.response?.status ?? (err as any)?.status;
       console.warn(
@@ -123,13 +112,10 @@ export async function withRetry<T>(
   // All retries exhausted
   const error = lastError as any;
   error.retryExhausted = true;
-  console.warn(
-    `[Stellar RPC Retry] Exhausted all ${config.maxAttempts} retry attempts`,
-    {
-      statusCode: error?.response?.status ?? error?.status,
-      errorMessage: error?.message ?? String(error),
-    }
-  );
+  console.warn(`[Stellar RPC Retry] Exhausted all ${config.maxAttempts} retry attempts`, {
+    statusCode: error?.response?.status ?? error?.status,
+    errorMessage: error?.message ?? String(error),
+  });
   throw error;
 }
 
@@ -163,18 +149,44 @@ const sharedHttpAgent = new http.Agent({
   maxFreeSockets: Math.ceil(maxSockets / 4),
 });
 
+interface HorizonAxiosDefaults {
+  httpsAgent?: unknown;
+  httpAgent?: unknown;
+}
+
+function getHorizonAxiosDefaults(): HorizonAxiosDefaults | undefined {
+  return (Horizon as unknown as { AxiosClient?: { defaults?: HorizonAxiosDefaults } }).AxiosClient
+    ?.defaults;
+}
+
 // Wire the agent into Horizon's shared axios client when the SDK exposes it so
 // every Horizon.Server instance created in this process reuses the connection
 // pool. Stellar SDK versions differ on whether this singleton is public.
-if (Horizon.AxiosClient?.defaults) {
-  Horizon.AxiosClient.defaults.httpsAgent = sharedAgent;
-  Horizon.AxiosClient.defaults.httpAgent = sharedHttpAgent;
+const horizonAxiosDefaults = getHorizonAxiosDefaults();
+if (horizonAxiosDefaults) {
+  horizonAxiosDefaults.httpsAgent = sharedAgent;
+  horizonAxiosDefaults.httpAgent = sharedHttpAgent;
 }
 
-/** Call on process shutdown to drain in-flight requests and close sockets. */
+/**
+ * Drain in-flight requests and close the shared agent sockets.
+ *
+ * Only call this once, at true process shutdown. Destroying the agents makes
+ * them unusable, so servers created before this call keep stale references;
+ * Horizon's shared axios defaults are cleared here so servers created
+ * afterwards do not reuse the destroyed agents. Calling this during any
+ * earlier shutdown window, or more than once, cannot revive already-created
+ * clients.
+ */
 export function drainSharedAgent(): void {
   sharedAgent.destroy();
   sharedHttpAgent.destroy();
+
+  const defaults = getHorizonAxiosDefaults();
+  if (defaults) {
+    defaults.httpsAgent = undefined;
+    defaults.httpAgent = undefined;
+  }
 }
 
 export function getHorizonServer(network: NetworkName = "testnet"): Horizon.Server {

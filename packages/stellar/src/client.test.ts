@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { getNetwork, getHorizonServer, getRpcServer, getUsdcAsset, sharedAgent, withRetry } from "./client";
+import { Horizon } from "@stellar/stellar-sdk";
+import {
+  drainSharedAgent,
+  getNetwork,
+  getHorizonServer,
+  getRpcServer,
+  getUsdcAsset,
+  sharedAgent,
+  withRetry,
+} from "./client";
 import { STELLAR_NETWORKS } from "./constants";
 
 describe("client", () => {
@@ -59,6 +68,56 @@ describe("client", () => {
     });
   });
 
+  describe("drainSharedAgent", () => {
+    type HorizonAxiosClient = {
+      defaults: { httpsAgent?: unknown; httpAgent?: unknown };
+    };
+    const horizonModule = Horizon as unknown as { AxiosClient?: HorizonAxiosClient };
+    let originalAxiosClient: HorizonAxiosClient | undefined;
+
+    beforeEach(() => {
+      originalAxiosClient = horizonModule.AxiosClient;
+    });
+
+    afterEach(() => {
+      if (originalAxiosClient) {
+        horizonModule.AxiosClient = originalAxiosClient;
+      } else {
+        delete horizonModule.AxiosClient;
+      }
+    });
+
+    it("clears Horizon axios agent defaults so new servers do not reuse destroyed agents", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      drainSharedAgent();
+
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
+
+      const server = getHorizonServer("testnet");
+      expect(server.serverURL.toString()).toContain("horizon-testnet.stellar.org");
+      const serverHttpClient = (
+        server as unknown as { httpClient: { defaults: HorizonAxiosClient["defaults"] } }
+      ).httpClient;
+      expect(serverHttpClient.defaults.httpsAgent).not.toBe(sharedAgent);
+      expect(serverHttpClient.defaults.httpAgent).not.toBe(sharedAgent);
+    });
+
+    it("is idempotent when called twice", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      expect(() => {
+        drainSharedAgent();
+        drainSharedAgent();
+      }).not.toThrow();
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
+    });
+  });
+
   describe("withRetry", () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -82,10 +141,7 @@ describe("client", () => {
       const error = new Error("Rate limited");
       (error as any).response = { status: 429 };
 
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce("success");
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
       await vi.runAllTimersAsync();
@@ -99,10 +155,7 @@ describe("client", () => {
       const error = new Error("Service unavailable");
       (error as any).response = { status: 503 };
 
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce("success");
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
       await vi.runAllTimersAsync();
@@ -116,10 +169,7 @@ describe("client", () => {
       const error = new Error("Gateway timeout");
       (error as any).response = { status: 504 };
 
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce("success");
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
       await vi.runAllTimersAsync();
@@ -132,10 +182,7 @@ describe("client", () => {
     it("should retry on network timeout errors", async () => {
       const error = new Error("Connection timeout");
 
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce("success");
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
       await vi.runAllTimersAsync();
@@ -234,10 +281,7 @@ describe("client", () => {
       const error = new Error("Rate limited");
       (error as any).response = { status: 429 };
 
-      const fn = vi
-        .fn()
-        .mockRejectedValueOnce(error)
-        .mockResolvedValueOnce("success");
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
       await vi.runAllTimersAsync();

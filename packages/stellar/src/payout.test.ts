@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setLogger } from "./logger";
 import type { SequenceStore } from "./sequence";
 
 const mocks = vi.hoisted(() => {
@@ -6,6 +7,7 @@ const mocks = vi.hoisted(() => {
   const loadAccountMock = vi.fn();
   const paymentMock = vi.fn((operation) => operation);
   const memoTextMock = vi.fn((value: string) => value);
+  const loggerWarnMock = vi.fn();
 
   class MockAccount {
     constructor(
@@ -56,6 +58,7 @@ const mocks = vi.hoisted(() => {
     MockAccount,
     MockTransactionBuilder,
     loadAccountMock,
+    loggerWarnMock,
     memoTextMock,
     paymentMock,
     submitTransactionMock,
@@ -89,7 +92,12 @@ vi.mock("@stellar/stellar-sdk", () => ({
   BASE_FEE: "100",
 }));
 
-import { isRetriableStellarError, submitBatchPayout, feeBumpTransaction, isInsufficientFeeError } from "./payout";
+import {
+  isRetriableStellarError,
+  submitBatchPayout,
+  feeBumpTransaction,
+  isInsufficientFeeError,
+} from "./payout";
 
 class InMemorySequenceStore implements SequenceStore {
   private readonly values = new Map<string, string>();
@@ -127,10 +135,16 @@ describe("submitBatchPayout", () => {
     mocks.MockTransactionBuilder.sourceSequences = [];
     mocks.MockTransactionBuilder.operationCounts = [];
     vi.clearAllMocks();
+    setLogger({ warn: mocks.loggerWarnMock });
     mocks.loadAccountMock.mockResolvedValue(new mocks.MockAccount("GTESTPUBLICKEY", "100"));
     mocks.submitTransactionMock.mockImplementation(async () => ({
       hash: `tx-${mocks.submitTransactionMock.mock.calls.length}`,
     }));
+  });
+
+  afterEach(() => {
+    setLogger(undefined);
+    vi.restoreAllMocks();
   });
 
   it("submits a one-recipient payload as one transaction with one operation", async () => {
@@ -153,13 +167,9 @@ describe("submitBatchPayout", () => {
   it("submits 51 recipients as two transactions with chunk sizes 50 and 1", async () => {
     const recipients = buildRecipients(51);
 
-    const results = await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-51",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    const results = await submitBatchPayout(recipients, "SSECRET", "challenge-51", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(2);
     expect(mocks.MockTransactionBuilder.operationCounts).toEqual([50, 1]);
@@ -172,13 +182,9 @@ describe("submitBatchPayout", () => {
   it("submits exactly 50 recipients as a single transaction", async () => {
     const recipients = buildRecipients(50);
 
-    const results = await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-50",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    const results = await submitBatchPayout(recipients, "SSECRET", "challenge-50", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(1);
     expect(mocks.MockTransactionBuilder.operationCounts).toEqual([50]);
@@ -189,13 +195,9 @@ describe("submitBatchPayout", () => {
   it("submits exactly 100 recipients as two transactions of 50 each", async () => {
     const recipients = buildRecipients(100);
 
-    const results = await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-100",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    const results = await submitBatchPayout(recipients, "SSECRET", "challenge-100", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(2);
     expect(mocks.MockTransactionBuilder.operationCounts).toEqual([50, 50]);
@@ -205,13 +207,9 @@ describe("submitBatchPayout", () => {
   it("submits 101 recipients as three transactions", async () => {
     const recipients = buildRecipients(101);
 
-    const results = await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-101",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    const results = await submitBatchPayout(recipients, "SSECRET", "challenge-101", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(3);
     expect(mocks.MockTransactionBuilder.operationCounts).toEqual([50, 50, 1]);
@@ -221,13 +219,9 @@ describe("submitBatchPayout", () => {
   it("every batch contains no more than 50 payment operations", async () => {
     const recipients = buildRecipients(101);
 
-    await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-cap",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    await submitBatchPayout(recipients, "SSECRET", "challenge-cap", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     for (const count of mocks.MockTransactionBuilder.operationCounts) {
       expect(count).toBeLessThanOrEqual(50);
@@ -255,13 +249,9 @@ describe("submitBatchPayout", () => {
   it("submits 250 recipients as five transactions", async () => {
     const recipients = buildRecipients(250);
 
-    const results = await submitBatchPayout(
-      recipients,
-      "SSECRET",
-      "challenge-250",
-      "testnet",
-      { sequenceStore: new InMemorySequenceStore() }
-    );
+    const results = await submitBatchPayout(recipients, "SSECRET", "challenge-250", "testnet", {
+      sequenceStore: new InMemorySequenceStore(),
+    });
 
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(5);
     expect(mocks.MockTransactionBuilder.operationCounts).toEqual([50, 50, 50, 50, 50]);
@@ -270,6 +260,7 @@ describe("submitBatchPayout", () => {
   });
 
   it("skips recipients with bad amounts, logs clearly, and continues the batch", async () => {
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const onInvalidRecipient = vi.fn();
     const valid = { address: "GVALID", amount: "2.5000000" };
     const invalid = { address: "GINVALID", amount: "-1.0000000" };
@@ -286,8 +277,36 @@ describe("submitBatchPayout", () => {
       invalid,
       "amount must be a positive Stellar amount with up to 7 decimal places"
     );
+    expect(mocks.loggerWarnMock).not.toHaveBeenCalled();
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
     expect(mocks.paymentMock).toHaveBeenCalledTimes(1);
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(1);
+    expect(results).toEqual([
+      {
+        txHash: "tx-1",
+        recipients: [valid],
+        success: true,
+      },
+    ]);
+  });
+
+  it("logs skipped invalid recipients through the logger when no callback is supplied", async () => {
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const valid = { address: "GVALID", amount: "2.5000000" };
+    const invalid = { address: "", amount: "1.0000000" };
+
+    const results = await submitBatchPayout(
+      [invalid, valid],
+      "SSECRET",
+      "challenge-default-log",
+      "testnet"
+    );
+
+    expect(mocks.loggerWarnMock).toHaveBeenCalledWith("Skipping invalid payout recipient", {
+      recipient: invalid,
+      reason: "missing address",
+    });
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
     expect(results).toEqual([
       {
         txHash: "tx-1",

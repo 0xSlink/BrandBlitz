@@ -1,7 +1,17 @@
 import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import { randomBytes } from "node:crypto";
-import { getRpcServer, getUsdcAsset, getNetworkConfig, withRetry, type NetworkName, type RetryOptions } from "./client";
+import {
+  getRpcServer,
+  getUsdcAsset,
+  getNetworkConfig,
+  withRetry,
+  type NetworkName,
+  type RetryOptions,
+} from "./client";
 import { DEPOSIT_POLL_INTERVAL_MS } from "./constants";
+import { warn } from "./logger";
+
+const DEPOSIT_EVENT_CONCURRENCY = 10;
 
 export interface DepositEvent {
   txHash: string;
@@ -30,10 +40,7 @@ export function generateDepositMemo(): string {
 
 export function validateDepositMemo(memo: string | null): DepositMemoValidation {
   if (!memo?.trim()) return { valid: false, reason: "missing" };
-  if (
-    Buffer.byteLength(memo, "utf8") > 28 ||
-    /[\u0000-\u001f\u007f]/.test(memo)
-  ) {
+  if (Buffer.byteLength(memo, "utf8") > 28 || /[\u0000-\u001f\u007f]/.test(memo)) {
     return { valid: false, reason: "invalid_format" };
   }
   return { valid: true, memo };
@@ -64,9 +71,7 @@ export async function fetchDepositEvents(
             type: "contract",
             // SAC (Stellar Asset Contract) transfer events for USDC
             contractIds: [usdc.contractId(networkPassphrase)],
-            topics: [
-              ["transfer", "*", hotWalletAddress],
-            ],
+            topics: [["transfer", "*", hotWalletAddress]],
           },
         ],
         limit: 200,
@@ -74,53 +79,60 @@ export async function fetchDepositEvents(
     { maxAttempts: 5, baseDelayMs: 250, maxDelayMs: 30_000 }
   );
 
-  const events: DepositEvent[] = [];
+  const processed: Array<DepositEvent | undefined> = new Array(response.events.length);
 
-  for (const event of response.events) {
-    try {
-      const txMeta = await withRetry(
-        () => rpc.getTransaction(event.txHash),
-        { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 5_000 }
-      );
-      if (txMeta.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        console.warn(`Skipping unsuccessful transaction: ${event.txHash}`, { status: txMeta.status });
-        continue;
-      }
+  for (let i = 0; i < response.events.length; i += DEPOSIT_EVENT_CONCURRENCY) {
+    const batch = response.events.slice(i, i + DEPOSIT_EVENT_CONCURRENCY);
+    await Promise.all(
+      batch.map(async (event, offset) => {
+        try {
+          const txMeta = await withRetry(() => rpc.getTransaction(event.txHash), {
+            maxAttempts: 3,
+            baseDelayMs: 100,
+            maxDelayMs: 5_000,
+          });
+          if (txMeta.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+            warn(`Skipping unsuccessful transaction: ${event.txHash}`, {
+              status: txMeta.status,
+            });
+            return;
+          }
 
-      if (!event.ledgerClosedAt) {
-        console.warn(`Skipping event with missing ledgerClosedAt: ${event.txHash}`);
-        continue;
-      }
+          if (!event.ledgerClosedAt) {
+            warn(`Skipping event with missing ledgerClosedAt: ${event.txHash}`);
+            return;
+          }
 
-      const memo = (txMeta as any).memo?.text ?? null;
-      const memoValidation = validateDepositMemo(memo);
-      if (!memoValidation.valid) {
-        console.warn("Rejecting deposit with invalid memo", {
-          reason: memoValidation.reason,
-          memo: memo?.slice(0, 28) ?? null,
-          txHash: event.txHash,
-          senderAccount: (event as any).from ?? null,
-        });
-        continue;
-      }
-      const amount = event.value?.toString() ?? "0";
+          const memo = (txMeta as any).memo?.text ?? null;
+          const memoValidation = validateDepositMemo(memo);
+          if (!memoValidation.valid) {
+            warn("Rejecting deposit with invalid memo", {
+              reason: memoValidation.reason,
+              memo: memo?.slice(0, 28) ?? null,
+              txHash: event.txHash,
+              senderAccount: (event as any).from ?? null,
+            });
+            return;
+          }
+          const amount = event.value?.toString() ?? "0";
 
-      events.push({
-        txHash: event.txHash,
-        amount,
-        memo: memoValidation.memo,
-        to: hotWalletAddress,
-        ledger: event.ledger,
-        createdAt: new Date(event.ledgerClosedAt).toISOString(),
-      });
-    } catch (err) {
-      console.warn(`Error processing deposit event ${event.txHash}:`, err);
-      continue;
-    }
+          processed[i + offset] = {
+            txHash: event.txHash,
+            amount,
+            memo: memoValidation.memo,
+            to: hotWalletAddress,
+            ledger: event.ledger,
+            createdAt: new Date(event.ledgerClosedAt).toISOString(),
+          };
+        } catch (err) {
+          warn(`Error processing deposit event ${event.txHash}:`, err);
+        }
+      })
+    );
   }
 
   return {
-    events,
+    events: processed.filter((event): event is DepositEvent => event !== undefined),
     latestLedger: response.latestLedger,
   };
 }
@@ -149,27 +161,29 @@ export async function getDepositConfirmationCount(
   const rpc = getRpcServer(network);
 
   try {
-    const txMeta = await withRetry(
-      () => rpc.getTransaction(txHash),
-      { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 5_000 }
-    );
+    const txMeta = await withRetry(() => rpc.getTransaction(txHash), {
+      maxAttempts: 3,
+      baseDelayMs: 100,
+      maxDelayMs: 5_000,
+    });
 
     if (txMeta.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       return 0;
     }
 
     // Get current ledger
-    const health = await withRetry(
-      () => rpc.getHealth(),
-      { maxAttempts: 2, baseDelayMs: 100, maxDelayMs: 2_000 }
-    );
+    const health = await withRetry(() => rpc.getHealth(), {
+      maxAttempts: 2,
+      baseDelayMs: 100,
+      maxDelayMs: 2_000,
+    });
 
     const currentLedger = health.ledger.sequence;
     const confirmations = Math.max(0, currentLedger - txLedger);
 
     return confirmations;
   } catch (err) {
-    console.warn(`Error checking deposit confirmations for ${txHash}:`, err);
+    warn(`Error checking deposit confirmations for ${txHash}:`, err);
     return 0;
   }
 }
