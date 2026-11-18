@@ -38,10 +38,13 @@ const FormSchema = z.object({
       num <= MAX_CHALLENGE_DURATION_HOURS
     );
   }, "Duration must be between 1 and 720 hours"),
+  refundPolicy: z.enum(["full", "partial_percentage", "none_after_start"]),
+  refundPercentage: z.number().min(0).max(100),
 });
 
 type BrandKitFields = z.infer<typeof FormSchema>;
 type FieldName = keyof BrandKitFields;
+type RefundPolicy = "full" | "partial_percentage" | "none_after_start";
 
 export function BrandKitForm({ apiToken }: BrandKitFormProps) {
   const router = useRouter();
@@ -49,7 +52,7 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
   const [error, setError] = useState<string | null>(null);
   const [touched, setTouched] = useState<Partial<Record<FieldName, boolean>>>({});
 
-  const [fields, setFields] = useState({
+  const [fields, setFields] = useState<BrandKitFields & { refundPolicy: RefundPolicy }>({
     name: "",
     tagline: "",
     brandStory: "",
@@ -57,10 +60,13 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
     secondaryColor: "#a5b4fc",
     poolAmountUsdc: "",
     durationHours: "72",
+    refundPolicy: "full",
+    refundPercentage: 100,
   });
 
   const [logoKey, setLogoKey] = useState<string | null>(null);
   const [productImageKeys, setProductImageKeys] = useState<string[]>([]);
+  const [secondTier, setSecondTier] = useState({ entryFeeUsdc: "", prizePoolUsdc: "" });
 
   const hasRequiredFields = fields.name.trim() !== "" && fields.poolAmountUsdc.trim() !== "";
   const hasValidColors =
@@ -98,6 +104,14 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canSubmit) {
+      return;
+    }
+
+    if (
+      secondTier.prizePoolUsdc &&
+      Number(secondTier.prizePoolUsdc) >= Number(fields.poolAmountUsdc)
+    ) {
+      setError("The higher-stakes prize pool must be smaller than the total pool.");
       return;
     }
 
@@ -163,6 +177,8 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
             brandId,
             poolAmountUsdc: fields.poolAmountUsdc,
             endsAt,
+            refundPolicy: fields.refundPolicy,
+            refundPercentage: fields.refundPercentage,
           },
           { skipErrorToast: true }
         );
@@ -304,7 +320,7 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
               {fieldError("secondaryColor")}
             </div>
           </div>
-          <div className="space-y-2 mt-6">
+          <div className="mt-6 space-y-2">
             <Label>Gradient Preview</Label>
             <div
               className="h-16 w-full rounded-md border border-[var(--border)] shadow-sm"
@@ -380,6 +396,32 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
             <p className="text-xs text-[var(--muted-foreground)]">
               You will receive a Stellar deposit address to fund the prize pool after creation.
             </p>
+            <div className="grid gap-3 rounded-lg border border-[var(--border)] p-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="secondTierEntryFee">Optional higher-stakes entry fee (USDC)</Label>
+                <Input
+                  id="secondTierEntryFee"
+                  inputMode="decimal"
+                  value={secondTier.entryFeeUsdc}
+                  onChange={(event) =>
+                    setSecondTier((current) => ({ ...current, entryFeeUsdc: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="secondTierPrizePool">
+                  Optional higher-stakes prize pool (USDC)
+                </Label>
+                <Input
+                  id="secondTierPrizePool"
+                  inputMode="decimal"
+                  value={secondTier.prizePoolUsdc}
+                  onChange={(event) =>
+                    setSecondTier((current) => ({ ...current, prizePoolUsdc: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
           </div>
 
           <div className="space-y-2">
@@ -399,6 +441,42 @@ export function BrandKitForm({ apiToken }: BrandKitFormProps) {
               }
             />
             {fieldError("durationHours")}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="refundPolicy">Cancellation refund policy</Label>
+            <select
+              id="refundPolicy"
+              value={fields.refundPolicy}
+              onChange={(event) =>
+                setFields((prev) => ({
+                  ...prev,
+                  refundPolicy: event.target.value as RefundPolicy,
+                }))
+              }
+              className="w-full rounded border border-[var(--border)] bg-[var(--background)] px-3 py-2"
+            >
+              <option value="full">Full refund</option>
+              <option value="partial_percentage">Partial refund</option>
+              <option value="none_after_start">No refund after challenge starts</option>
+            </select>
+            {fields.refundPolicy === "partial_percentage" && (
+              <label className="block space-y-1 text-sm">
+                <span>Refund percentage</span>
+                <Input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={fields.refundPercentage}
+                  onChange={(event) =>
+                    setFields((prev) => ({ ...prev, refundPercentage: Number(event.target.value) }))
+                  }
+                />
+              </label>
+            )}
+            <p className="text-xs text-[var(--muted-foreground)]">
+              This policy is shown to participants before they join.
+            </p>
           </div>
         </CardContent>
       </Card>

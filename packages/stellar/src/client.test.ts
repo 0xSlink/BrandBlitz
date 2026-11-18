@@ -1,7 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Horizon } from "@stellar/stellar-sdk";
 import {
-  drainSharedAgent,
   getNetwork,
   getHorizonServer,
   getRpcServer,

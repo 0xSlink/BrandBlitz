@@ -10,10 +10,14 @@ import {
   getUserPublicProfileByUsername,
   searchUsersByUsername,
   markOnboardingCompleted,
+  updateUserPreferences,
+  setUserVanitySlug,
 } from "../db/queries/users";
 import { getReferralStats, ensureUserReferralCode } from "../services/referrals";
 import { stroopsToUsdc } from "../lib/usdc";
 import { getStreak, repairStreak, getUserActivity, getStreakDetail } from "../services/streaks";
+import { removePushSubscription } from "../services/push";
+import { getWebPushPublicKey, isSafePushEndpoint, isWebPushConfigured } from "../lib/web-push";
 import { query } from "../db";
 import {
   sendVerificationCode,
@@ -21,11 +25,11 @@ import {
   normalizePhoneNumber,
   verifyOtpWithBruteForceProtection,
 } from "../services/phone";
-import { authenticate } from "../middleware/authenticate";
+import { authenticate, optionalAuth } from "../middleware/authenticate";
 import { requireActiveUser } from "../middleware/require-active-user";
 import { createError } from "../middleware/error";
 import { redis } from "../lib/redis";
-import { apiLimiter, phoneRateLimit } from "../middleware/rate-limit";
+import { apiLimiter, phoneRateLimit, reportLimiter } from "../middleware/rate-limit";
 import { getBadgesForUser } from "../services/badges";
 import { config } from "../lib/config";
 import { getSessionHistory, type HistoryStatusFilter } from "../db/queries/sessions";
@@ -33,8 +37,49 @@ import { CursorQuerySchema } from "../db/pagination";
 import { signAccessToken } from "../lib/tokens";
 import { tokenRevocationKey, tokenTtlSeconds } from "../middleware/authenticate";
 import { logger } from "../lib/logger";
+import { handleUpdatePinnedBadges } from "./badges";
+import multer from "multer";
+import { ALLOWED_UPLOAD_TYPES, ALLOWED_CONTENT_TYPES, detectMime } from "./upload";
+import {
+  BUCKETS,
+  getPublicUrl,
+  uploadObject,
+  deleteObject,
+  optimizeBuffer,
+} from "@brandblitz/storage";
 
 const router: Router = Router();
+
+const UserReportSchema = z
+  .object({
+    reason: z.enum(["harassment", "spam", "impersonation", "other"]),
+    details: z.string().trim().max(1000).optional(),
+  })
+  .strict();
+
+router.post("/:id/report", authenticate, reportLimiter, async (req, res) => {
+  const body = UserReportSchema.parse(req.body);
+  if (req.params.id === req.user!.sub) throw createError("You cannot report yourself", 400);
+  const reported = await findUserById(req.params.id);
+  if (!reported) throw createError("User not found", 404);
+  await query(
+    `INSERT INTO user_reports (reporter_id, reported_id, reason, details)
+     VALUES ($1, $2, $3, $4)`,
+    [req.user!.sub, req.params.id, body.reason, body.details ?? null]
+  );
+  res.status(201).json({ reported: true });
+});
+
+router.post("/:id/block", authenticate, async (req, res) => {
+  if (req.params.id === req.user!.sub) throw createError("You cannot block yourself", 400);
+  const reported = await findUserById(req.params.id);
+  if (!reported) throw createError("User not found", 404);
+  await query(
+    `INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+    [req.user!.sub, req.params.id]
+  );
+  res.status(201).json({ blocked: true });
+});
 
 /**
  * GET /users/me
@@ -49,6 +94,10 @@ router.get("/me", authenticate, async (req, res) => {
     email: user.email,
     display_name: user.display_name,
     username: user.username,
+    referral_code: user.referral_code,
+    vanity_slug: user.vanity_slug,
+    timezone: user.timezone,
+    accessibility_mode: user.accessibility_mode,
     avatar_url: user.avatar_url,
     stellar_address: user.stellar_address,
     embedded_wallet_address: user.embedded_wallet_address,
@@ -61,11 +110,289 @@ router.get("/me", authenticate, async (req, res) => {
     streak_repairs_this_month: user.streak_repairs_this_month,
     streak_repair_available: user.streak_repair_available,
     onboarding_completed: user.onboarding_completed,
+    pinned_badges: (user as any).pinned_badges ?? [],
+    pinnedBadges: (user as any).pinned_badges ?? [],
     created_at: user.created_at,
     updated_at: user.updated_at,
   };
 
   res.json({ user: safeUser });
+});
+
+const avatarUpload = multer({
+  limits: {
+    fileSize: ALLOWED_UPLOAD_TYPES["user-avatar"].maxMb * 1024 * 1024 + 1024,
+  },
+  storage: multer.memoryStorage(),
+}).fields([
+  { name: "avatar", maxCount: 1 },
+  { name: "file", maxCount: 1 },
+]);
+
+function avatarUploadMiddleware(req: any, res: any, next: any) {
+  avatarUpload(req, res, (err: any) => {
+    if (err) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({
+          error: `File exceeds maximum allowed size of ${ALLOWED_UPLOAD_TYPES["user-avatar"].maxMb}MB`,
+          code: "FILE_TOO_LARGE",
+        });
+      }
+      return next(err);
+    }
+    next();
+  });
+}
+
+/**
+ * POST /users/me/avatar
+ * Upload and update the authenticated user's custom avatar (#1018).
+ * Reuses the existing upload pipeline in upload.ts and its validation.
+ * Deletes old avatar from storage ONLY after the new one is stored and user record updated.
+ */
+router.post("/me/avatar", authenticate, avatarUploadMiddleware, async (req, res) => {
+  const file = (req.files as any)?.avatar?.[0] || (req.files as any)?.file?.[0] || req.file;
+
+  if (file) {
+    const maxBytes = ALLOWED_UPLOAD_TYPES["user-avatar"].maxMb * 1024 * 1024;
+    if (file.size > maxBytes || file.buffer.length > maxBytes) {
+      throw createError(
+        `File exceeds maximum allowed size of ${ALLOWED_UPLOAD_TYPES["user-avatar"].maxMb}MB`,
+        413,
+        "FILE_TOO_LARGE"
+      );
+    }
+
+    const detectedMime = detectMime(file.buffer);
+    if (!detectedMime || !ALLOWED_CONTENT_TYPES.includes(detectedMime)) {
+      throw createError(
+        "File content does not match allowed content types (image/png, image/jpeg, image/webp)",
+        415,
+        "UNSUPPORTED_MEDIA_TYPE"
+      );
+    }
+
+    if (file.mimetype && !(ALLOWED_CONTENT_TYPES as readonly string[]).includes(file.mimetype)) {
+      throw createError("Declared content type is not allowed", 400, "INVALID_CONTENT_TYPE");
+    }
+
+    // Never build storage keys from client-supplied filenames
+    const key = `avatars/${crypto.randomUUID()}.webp`;
+
+    const { webpBuffer } = await optimizeBuffer(file.buffer, "user-avatar", detectedMime);
+
+    await uploadObject({
+      bucket: BUCKETS.BRAND_ASSETS,
+      key,
+      body: webpBuffer,
+      contentType: "image/webp",
+      immutable: true,
+    });
+
+    const newAvatarUrl = getPublicUrl(BUCKETS.BRAND_ASSETS, key);
+
+    const user = await findUserById(req.user!.sub);
+    const oldAvatarUrl = user?.avatar_url;
+
+    await query("UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2", [
+      newAvatarUrl,
+      req.user!.sub,
+    ]);
+
+    // Cleanup old avatar from storage only after successful DB update
+    if (oldAvatarUrl) {
+      const match = oldAvatarUrl.match(/avatars\/[a-zA-Z0-9_\-\.]+/);
+      if (match) {
+        try {
+          await deleteObject(BUCKETS.BRAND_ASSETS, match[0]);
+        } catch (cleanupErr) {
+          logger.warn("Failed to delete replaced avatar from storage", {
+            oldKey: match[0],
+            userId: req.user!.sub,
+            error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+          });
+        }
+      }
+    }
+
+    res.status(200).json({ avatarUrl: newAvatarUrl, publicUrl: newAvatarUrl });
+    return;
+  }
+
+  // Also support JSON body with presigned key
+  if (req.body?.key) {
+    const { key: uploadKey } = z.object({ key: z.string().min(1) }).parse(req.body);
+    if (!uploadKey.startsWith("avatars/")) {
+      throw createError("Invalid avatar key prefix", 400);
+    }
+
+    const { optimizeImage } = await import("@brandblitz/storage");
+    const optimizedKey = await optimizeImage(uploadKey, "user-avatar");
+    const newAvatarUrl = getPublicUrl(BUCKETS.BRAND_ASSETS, optimizedKey);
+
+    const user = await findUserById(req.user!.sub);
+    const oldAvatarUrl = user?.avatar_url;
+
+    await query("UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2", [
+      newAvatarUrl,
+      req.user!.sub,
+    ]);
+
+    if (oldAvatarUrl) {
+      const match = oldAvatarUrl.match(/avatars\/[a-zA-Z0-9_\-\.]+/);
+      if (match && match[0] !== optimizedKey) {
+        try {
+          await deleteObject(BUCKETS.BRAND_ASSETS, match[0]);
+        } catch (cleanupErr) {
+          logger.warn("Failed to delete replaced avatar from storage", {
+            oldKey: match[0],
+            userId: req.user!.sub,
+            error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+          });
+        }
+      }
+    }
+
+    res.status(200).json({ avatarUrl: newAvatarUrl, publicUrl: newAvatarUrl });
+    return;
+  }
+
+  throw createError("No avatar file provided", 400);
+});
+
+/**
+ * PATCH /users/me/pinned-badges
+ * Pin up to 3 earned badges to public profile (#1001).
+ */
+router.patch("/me/pinned-badges", authenticate, handleUpdatePinnedBadges);
+
+/**
+ * GET /users/me/api-keys
+ * List personal API keys for the authenticated user. Never exposes secret key hash.
+ * Closes #1027
+ */
+router.get("/me/api-keys", authenticate, async (req, res) => {
+  const result = await query<{
+    id: string;
+    name: string;
+    key_prefix: string;
+    scopes: string[];
+    created_at: string;
+    last_used_at: string | null;
+    revoked_at: string | null;
+  }>(
+    `SELECT id, name, key_prefix, scopes, created_at, last_used_at, revoked_at
+     FROM api_keys
+     WHERE user_id = $1
+     ORDER BY created_at DESC`,
+    [req.user!.sub]
+  );
+
+  res.json({
+    keys: result.rows.map((k) => ({
+      id: k.id,
+      name: k.name,
+      keyPrefix: k.key_prefix,
+      scopes: k.scopes,
+      createdAt: k.created_at,
+      lastUsedAt: k.last_used_at,
+      revokedAt: k.revoked_at,
+      isActive: k.revoked_at === null,
+    })),
+  });
+});
+
+const CreateApiKeySchema = z.object({
+  name: z.string().trim().min(1, "Key name is required").max(100),
+});
+
+/**
+ * POST /users/me/api-keys
+ * Generate a new personal API key. Returned once in full plaintext.
+ * Closes #1027
+ */
+router.post("/me/api-keys", authenticate, async (req, res) => {
+  const { name } = CreateApiKeySchema.parse(req.body);
+  const randomHex = crypto.randomBytes(24).toString("hex");
+  const fullKey = `bb_live_${randomHex}`;
+  const keyPrefix = fullKey.slice(0, 14);
+  const keyHash = crypto.createHash("sha256").update(fullKey).digest("hex");
+
+  const result = await query<{
+    id: string;
+    name: string;
+    key_prefix: string;
+    scopes: string[];
+    created_at: string;
+  }>(
+    `INSERT INTO api_keys (user_id, name, key_prefix, key_hash, scopes)
+     VALUES ($1, $2, $3, $4, ARRAY['read:stats']::TEXT[])
+     RETURNING id, name, key_prefix, scopes, created_at`,
+    [req.user!.sub, name, keyPrefix, keyHash]
+  );
+
+  const row = result.rows[0];
+
+  res.status(201).json({
+    id: row.id,
+    name: row.name,
+    key: fullKey,
+    keyPrefix: row.key_prefix,
+    scopes: row.scopes,
+    createdAt: row.created_at,
+  });
+});
+
+/**
+ * DELETE /users/me/api-keys/:id
+ * Revoke a personal API key.
+ * Closes #1027
+ */
+router.delete("/me/api-keys/:id", authenticate, async (req, res) => {
+  const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+
+  const result = await query<{ key_hash: string }>(
+    `UPDATE api_keys
+     SET revoked_at = NOW()
+     WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+     RETURNING key_hash`,
+    [id, req.user!.sub]
+  );
+
+  if (result.rows.length === 0) {
+    throw createError("API key not found or already revoked", 404);
+  }
+
+  const hash = result.rows[0].key_hash;
+  await redis.del(`apikey:hash:${hash}`).catch(() => null);
+
+  res.json({ success: true, message: "API key revoked" });
+});
+
+/**
+ * PATCH /users/me/reminder-preferences
+ * Update challenge reminder lead-time preferences.
+ * Closes #1025
+ */
+router.patch("/me/reminder-preferences", authenticate, async (req, res) => {
+  const schema = z.object({
+    defaultLeadTimeMinutes: z.number().int().min(1).max(10080),
+  });
+  const { defaultLeadTimeMinutes } = schema.parse(req.body);
+
+  await redis
+    .set(
+      `user:pref:reminder_lead_time:${req.user!.sub}`,
+      defaultLeadTimeMinutes.toString(),
+      "EX",
+      365 * 86400
+    )
+    .catch(() => null);
+
+  res.json({
+    success: true,
+    defaultLeadTimeMinutes,
+  });
 });
 
 /**
@@ -76,6 +403,30 @@ router.get("/me", authenticate, async (req, res) => {
 router.post("/me/onboarding/complete", authenticate, async (req, res) => {
   const completed = await markOnboardingCompleted(req.user!.sub);
   res.json({ success: true, onboardingCompleted: completed });
+});
+
+router.patch("/me/preferences", authenticate, async (req, res) => {
+  const parsed = z
+    .object({
+      timezone: z.string().trim().min(1).max(100).optional(),
+      accessibilityMode: z.boolean().optional(),
+    })
+    .strict()
+    .safeParse(req.body);
+  if (!parsed.success || (!parsed.data.timezone && parsed.data.accessibilityMode === undefined)) {
+    throw createError("Invalid preferences", 400, "INVALID_PREFERENCES");
+  }
+
+  if (parsed.data.timezone) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: parsed.data.timezone }).format();
+    } catch {
+      throw createError("Invalid IANA timezone", 400, "INVALID_TIMEZONE");
+    }
+  }
+
+  await updateUserPreferences(req.user!.sub, parsed.data);
+  res.json({ success: true });
 });
 
 router.get("/me/streak", authenticate, async (req, res) => {
@@ -191,6 +542,11 @@ router.get("/me/referrals/stats", authenticate, async (req, res) => {
 router.get("/me/referrals", authenticate, async (req, res) => {
   const userId = req.user!.sub;
   const referralCode = await ensureUserReferralCode(userId);
+  const vanityResult = await query<{ vanity_slug: string | null }>(
+    "SELECT vanity_slug FROM users WHERE id = $1 AND deleted_at IS NULL",
+    [userId]
+  );
+  const vanitySlug = vanityResult.rows[0]?.vanity_slug ?? null;
 
   const referredResult = await query<{
     id: string;
@@ -230,7 +586,8 @@ router.get("/me/referrals", authenticate, async (req, res) => {
   const totals = totalsResult.rows[0] || { pending_stroops: "0", confirmed_stroops: "0" };
 
   res.json({
-    referralCode,
+    referralCode: vanitySlug ?? referralCode,
+    vanitySlug,
     referredUsers: referredResult.rows.map((row) => ({
       id: row.id,
       username: row.username,
@@ -244,6 +601,47 @@ router.get("/me/referrals", authenticate, async (req, res) => {
       confirmedUsdc: stroopsToUsdc(BigInt(totals.confirmed_stroops)),
     },
   });
+});
+
+router.patch("/me/referral-code", authenticate, async (req, res) => {
+  const parsed = z
+    .object({
+      vanitySlug: z
+        .string()
+        .trim()
+        .toLowerCase()
+        .min(3)
+        .max(32)
+        .regex(/^[a-z0-9-]+$/),
+    })
+    .strict()
+    .safeParse(req.body);
+  if (
+    !parsed.success ||
+    /^(admin|support|api|www|help|official|brandblitz)$/.test(parsed.data.vanitySlug)
+  ) {
+    throw createError(
+      "Vanity slug must be 3-32 lowercase letters, numbers, or hyphens",
+      400,
+      "INVALID_VANITY_SLUG"
+    );
+  }
+
+  try {
+    await setUserVanitySlug(req.user!.sub, parsed.data.vanitySlug);
+  } catch (error) {
+    if (
+      error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: string }).code === "23505"
+    ) {
+      throw createError("That vanity slug is already in use", 409, "VANITY_SLUG_TAKEN");
+    }
+    throw error;
+  }
+
+  res.json({ vanitySlug: parsed.data.vanitySlug });
 });
 
 router.post("/streaks/repair", authenticate, async (req, res) => {
@@ -260,7 +658,7 @@ router.post("/streaks/repair", authenticate, async (req, res) => {
  * Public profile — display name, stats. No auth required.
  * Returns a redirect field if the username has been renamed.
  */
-router.get("/profile/:username", apiLimiter, async (req, res) => {
+router.get("/profile/:username", optionalAuth, apiLimiter, async (req, res) => {
   const { username } = z.object({ username: z.string() }).parse(req.params);
 
   // Check for username redirect first
@@ -272,6 +670,14 @@ router.get("/profile/:username", apiLimiter, async (req, res) => {
 
   const user = await getUserPublicProfileByUsername(username);
   if (!user) throw createError("User not found", 404);
+
+  if (req.user?.sub) {
+    const blocked = await query(
+      "SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2",
+      [req.user.sub, user.id]
+    );
+    if (blocked.rows.length > 0) throw createError("User not found", 404);
+  }
 
   const isOwner = req.user?.sub === user.id;
 
@@ -310,8 +716,9 @@ router.get("/:username/public", apiLimiter, async (req, res) => {
     league: "bronze" | "silver" | "gold" | null;
     status: string;
     deleted_at: string | null;
+    pinned_badges?: string[] | null;
   }>(
-    `SELECT id, username, display_name, avatar_url, created_at, league, status, deleted_at
+    `SELECT id, username, display_name, avatar_url, created_at, league, status, deleted_at, pinned_badges
      FROM users
      WHERE username = $1
      LIMIT 1`,
@@ -406,7 +813,18 @@ router.get("/:username/public", apiLimiter, async (req, res) => {
     };
   });
 
+  const pinnedBadgeDetails = (user.pinned_badges ?? []).map((slug) => {
+    const def = defMap.get(slug);
+    return {
+      slug,
+      name: def?.name ?? slug,
+      description: def?.description ?? "",
+      iconUrl: def?.iconUrl ?? null,
+    };
+  });
+
   res.json({
+    userId: user.id,
     username: user.username,
     displayName: user.display_name,
     avatarUrl: user.avatar_url,
@@ -416,6 +834,9 @@ router.get("/:username/public", apiLimiter, async (req, res) => {
     accuracyPct,
     league,
     badges,
+    pinnedBadges: user.pinned_badges ?? [],
+    pinned_badges: user.pinned_badges ?? [],
+    pinnedBadgeDetails,
   });
 });
 
@@ -630,6 +1051,161 @@ router.patch("/me/notifications/read-all", authenticate, async (req, res) => {
   ]);
 
   res.json({ success: true });
+});
+
+const PushSubscriptionSchema = z
+  .object({
+    endpoint: z.string().url().max(2048),
+    keys: z
+      .object({
+        p256dh: z.string().min(1).max(255),
+        auth: z.string().min(1).max(255),
+      })
+      .strict(),
+    user_agent: z.string().max(512).optional(),
+  })
+  .strict();
+
+/**
+ * GET /users/me/push/config
+ * Exposes whether Web Push is configured and the VAPID public key used by
+ * `PushManager.subscribe()` in the browser.
+ */
+router.get("/me/push/config", authenticate, (_req, res) => {
+  res.json({
+    configured: isWebPushConfigured(),
+    public_key: getWebPushPublicKey(),
+  });
+});
+
+/**
+ * GET /users/me/push/subscriptions
+ * Lists the authenticated user's registered devices plus their push opt-in.
+ */
+router.get("/me/push/subscriptions", authenticate, async (req, res) => {
+  const preference = await query<{ push_notifications_enabled: boolean }>(
+    `SELECT push_notifications_enabled FROM users WHERE id = $1`,
+    [req.user!.sub]
+  );
+
+  const subscriptions = await query<{
+    id: string;
+    endpoint: string;
+    user_agent: string | null;
+    last_used_at: string | null;
+    created_at: string;
+  }>(
+    `SELECT id, endpoint, user_agent, last_used_at, created_at
+     FROM push_subscriptions
+     WHERE user_id = $1
+     ORDER BY created_at DESC`,
+    [req.user!.sub]
+  );
+
+  res.json({
+    enabled: preference.rows[0]?.push_notifications_enabled ?? true,
+    subscriptions: subscriptions.rows,
+  });
+});
+
+/**
+ * POST /users/me/push/subscriptions
+ * Registers (or refreshes) a browser push subscription. Registering a device
+ * also opts the user back in to push if they had disabled it earlier.
+ */
+router.post("/me/push/subscriptions", authenticate, async (req, res) => {
+  const body = PushSubscriptionSchema.parse(req.body);
+
+  if (!isSafePushEndpoint(body.endpoint)) {
+    throw createError("Invalid push endpoint", 400, "INVALID_PUSH_ENDPOINT");
+  }
+
+  if (!isWebPushConfigured()) {
+    throw createError("Web push is not configured", 503, "PUSH_NOT_CONFIGURED");
+  }
+
+  const userAgent = body.user_agent ?? req.headers["user-agent"] ?? null;
+
+  const result = await query<{ id: string }>(
+    `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (user_id, endpoint)
+     DO UPDATE SET
+       p256dh = EXCLUDED.p256dh,
+       auth = EXCLUDED.auth,
+       user_agent = EXCLUDED.user_agent,
+       failure_count = 0,
+       updated_at = NOW()
+     RETURNING id`,
+    [req.user!.sub, body.endpoint, body.keys.p256dh, body.keys.auth, userAgent]
+  );
+
+  await query(
+    `UPDATE users SET push_notifications_enabled = TRUE, updated_at = NOW() WHERE id = $1`,
+    [req.user!.sub]
+  );
+
+  res.status(201).json({ success: true, id: result.rows[0]?.id });
+});
+
+/**
+ * DELETE /users/me/push/subscriptions
+ * Removes a single device subscription (used on browser unsubscribes).
+ */
+router.delete("/me/push/subscriptions", authenticate, async (req, res) => {
+  const { endpoint } = z.object({ endpoint: z.string().url().max(2048) }).parse(req.body);
+  const removed = await removePushSubscription(req.user!.sub, endpoint);
+  res.json({ success: true, removed });
+});
+
+/**
+ * PATCH /users/me/push/preferences
+ * Toggles push delivery independently of in-app notifications.
+ */
+router.patch("/me/push/preferences", authenticate, async (req, res) => {
+  const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body);
+
+  await query(
+    `UPDATE users SET push_notifications_enabled = $2, updated_at = NOW() WHERE id = $1`,
+    [req.user!.sub, enabled]
+  );
+
+  res.json({ success: true, enabled });
+});
+
+/**
+ * GET /users/me/notification-preferences
+ * Returns notification preferences for all categories (payout, badge, streak, referral).
+ */
+router.get("/me/notification-preferences", authenticate, async (req, res) => {
+  const prefs = await getNotificationPreferences(req.user!.sub);
+  res.json({ preferences: prefs });
+});
+
+/**
+ * PATCH /users/me/notification-preferences/:category
+ * Update a single notification preference category.
+ * Body: { enabled: boolean }
+ */
+router.patch("/me/notification-preferences/:category", authenticate, async (req, res) => {
+  const { category } = req.params;
+  const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body);
+
+  if (!parsed.success) {
+    throw createError("Invalid request body", 400, "INVALID_BODY");
+  }
+
+  const validCategories = ["payout", "badge", "streak", "referral"];
+  if (!validCategories.includes(category)) {
+    throw createError(`Invalid category. Must be one of: ${validCategories.join(", ")}`, 400, "INVALID_CATEGORY");
+  }
+
+  const updated = await updateNotificationPreference(req.user!.sub, category, parsed.data.enabled);
+  if (!updated) {
+    throw createError("Failed to update notification preference", 500);
+  }
+
+  res.json({ preference: updated });
 });
 
 /**

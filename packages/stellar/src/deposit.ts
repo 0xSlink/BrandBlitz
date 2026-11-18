@@ -79,56 +79,52 @@ export async function fetchDepositEvents(
     { maxAttempts: 5, baseDelayMs: 250, maxDelayMs: 30_000 }
   );
 
-  const processed: Array<DepositEvent | undefined> = new Array(response.events.length);
+  const events: DepositEvent[] = [];
 
-  for (let i = 0; i < response.events.length; i += DEPOSIT_EVENT_CONCURRENCY) {
-    const batch = response.events.slice(i, i + DEPOSIT_EVENT_CONCURRENCY);
-    await Promise.all(
-      batch.map(async (event, offset) => {
-        try {
-          const txMeta = await withRetry(() => rpc.getTransaction(event.txHash), {
-            maxAttempts: 3,
-            baseDelayMs: 100,
-            maxDelayMs: 5_000,
-          });
-          if (txMeta.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-            warn(`Skipping unsuccessful transaction: ${event.txHash}`, {
-              status: txMeta.status,
-            });
-            return;
-          }
+  for (const event of response.events) {
+    try {
+      const txMeta = await withRetry(() => rpc.getTransaction(event.txHash), {
+        maxAttempts: 3,
+        baseDelayMs: 100,
+        maxDelayMs: 5_000,
+      });
+      if (txMeta.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+        console.warn(`Skipping unsuccessful transaction: ${event.txHash}`, {
+          status: txMeta.status,
+        });
+        continue;
+      }
 
-          if (!event.ledgerClosedAt) {
-            warn(`Skipping event with missing ledgerClosedAt: ${event.txHash}`);
-            return;
-          }
+      if (!event.ledgerClosedAt) {
+        console.warn(`Skipping event with missing ledgerClosedAt: ${event.txHash}`);
+        continue;
+      }
 
-          const memo = (txMeta as any).memo?.text ?? null;
-          const memoValidation = validateDepositMemo(memo);
-          if (!memoValidation.valid) {
-            warn("Rejecting deposit with invalid memo", {
-              reason: memoValidation.reason,
-              memo: memo?.slice(0, 28) ?? null,
-              txHash: event.txHash,
-              senderAccount: (event as any).from ?? null,
-            });
-            return;
-          }
-          const amount = event.value?.toString() ?? "0";
+      const memo = (txMeta as any).memo?.text ?? null;
+      const memoValidation = validateDepositMemo(memo);
+      if (!memoValidation.valid) {
+        console.warn("Rejecting deposit with invalid memo", {
+          reason: memoValidation.reason,
+          memo: memo?.slice(0, 28) ?? null,
+          txHash: event.txHash,
+          senderAccount: (event as any).from ?? null,
+        });
+        continue;
+      }
+      const amount = event.value?.toString() ?? "0";
 
-          processed[i + offset] = {
-            txHash: event.txHash,
-            amount,
-            memo: memoValidation.memo,
-            to: hotWalletAddress,
-            ledger: event.ledger,
-            createdAt: new Date(event.ledgerClosedAt).toISOString(),
-          };
-        } catch (err) {
-          warn(`Error processing deposit event ${event.txHash}:`, err);
-        }
-      })
-    );
+      events.push({
+        txHash: event.txHash,
+        amount,
+        memo: memoValidation.memo,
+        to: hotWalletAddress,
+        ledger: event.ledger,
+        createdAt: new Date(event.ledgerClosedAt).toISOString(),
+      });
+    } catch (err) {
+      console.warn(`Error processing deposit event ${event.txHash}:`, err);
+      continue;
+    }
   }
 
   return {
