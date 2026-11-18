@@ -21,12 +21,53 @@ describe("deposit memo generation", () => {
 
     expect(first).not.toBe(second);
     expect(Buffer.byteLength(first, "utf8")).toBeLessThanOrEqual(28);
-    expect(validateDepositMemo(first)).toEqual({ valid: true, memo: first });
-    expect(validateDepositMemo(second)).toEqual({ valid: true, memo: second });
   });
 
   it("rejects memos that exceed Stellar's 28-byte text memo limit", () => {
     expect(validateDepositMemo("a".repeat(29))).toMatchObject({ valid: false });
+  });
+});
+
+describe("validateDepositMemo", () => {
+  it("accepts a valid v4 UUID", () => {
+    const memo = "550e8400-e29b-41d4-a716-446655440000";
+    expect(validateDepositMemo(memo)).toEqual({ valid: true, memo });
+  });
+
+  it("rejects a null memo as missing", () => {
+    expect(validateDepositMemo(null)).toEqual({ valid: false, reason: "missing" });
+  });
+
+  it("rejects an empty memo as missing", () => {
+    expect(validateDepositMemo("")).toEqual({ valid: false, reason: "missing" });
+  });
+
+  it("rejects a whitespace-only memo as missing", () => {
+    expect(validateDepositMemo("   ")).toEqual({ valid: false, reason: "missing" });
+  });
+
+  it("rejects a non-UUID string as invalid_format", () => {
+    expect(validateDepositMemo("not-a-deposit-memo")).toEqual({
+      valid: false,
+      reason: "invalid_format",
+    });
+  });
+
+  it("accepts an uppercase v4 UUID", () => {
+    const memo = "550E8400-E29B-41D4-A716-446655440000";
+    expect(validateDepositMemo(memo)).toEqual({ valid: true, memo });
+  });
+
+  it("rejects a UUID with the wrong version nibble", () => {
+    expect(validateDepositMemo("550e8400-e29b-11d4-a716-446655440000")).toEqual({
+      valid: false,
+      reason: "invalid_format",
+    });
+  });
+
+  it("trims surrounding whitespace before validation", () => {
+    const memo = "550e8400-e29b-41d4-a716-446655440000";
+    expect(validateDepositMemo(`  ${memo}  `)).toEqual({ valid: true, memo });
   });
 });
 

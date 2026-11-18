@@ -52,11 +52,16 @@ function isRetryableError(err: unknown, retryableStatusCodes: number[]): boolean
     return true;
   }
 
+  if ((err as any)?.code === "ETIMEDOUT") {
+    return true;
+  }
+
   const message = String((err as any)?.message ?? "").toLowerCase();
   return (
     message.includes("econnrefused") ||
     message.includes("econnreset") ||
     message.includes("enotfound") ||
+    message.includes("etimedout") ||
     message.includes("timeout") ||
     message.includes("timed out") ||
     message.includes("networkconnection")
