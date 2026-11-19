@@ -9,6 +9,9 @@ import {
   type RetryOptions,
 } from "./client";
 import { DEPOSIT_POLL_INTERVAL_MS } from "./constants";
+import { warn } from "./logger";
+
+const DEPOSIT_EVENT_CONCURRENCY = 10;
 
 export interface DepositEvent {
   txHash: string;
@@ -129,7 +132,7 @@ export async function fetchDepositEvents(
   }
 
   return {
-    events,
+    events: processed.filter((event): event is DepositEvent => event !== undefined),
     latestLedger: response.latestLedger,
   };
 }
@@ -180,7 +183,7 @@ export async function getDepositConfirmationCount(
 
     return confirmations;
   } catch (err) {
-    console.warn(`Error checking deposit confirmations for ${txHash}:`, err);
+    warn(`Error checking deposit confirmations for ${txHash}:`, err);
     return 0;
   }
 }

@@ -93,6 +93,56 @@ describe("client", () => {
     });
   });
 
+  describe("drainSharedAgent", () => {
+    type HorizonAxiosClient = {
+      defaults: { httpsAgent?: unknown; httpAgent?: unknown };
+    };
+    const horizonModule = Horizon as unknown as { AxiosClient?: HorizonAxiosClient };
+    let originalAxiosClient: HorizonAxiosClient | undefined;
+
+    beforeEach(() => {
+      originalAxiosClient = horizonModule.AxiosClient;
+    });
+
+    afterEach(() => {
+      if (originalAxiosClient) {
+        horizonModule.AxiosClient = originalAxiosClient;
+      } else {
+        delete horizonModule.AxiosClient;
+      }
+    });
+
+    it("clears Horizon axios agent defaults so new servers do not reuse destroyed agents", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      drainSharedAgent();
+
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
+
+      const server = getHorizonServer("testnet");
+      expect(server.serverURL.toString()).toContain("horizon-testnet.stellar.org");
+      const serverHttpClient = (
+        server as unknown as { httpClient: { defaults: HorizonAxiosClient["defaults"] } }
+      ).httpClient;
+      expect(serverHttpClient.defaults.httpsAgent).not.toBe(sharedAgent);
+      expect(serverHttpClient.defaults.httpAgent).not.toBe(sharedAgent);
+    });
+
+    it("is idempotent when called twice", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      expect(() => {
+        drainSharedAgent();
+        drainSharedAgent();
+      }).not.toThrow();
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
+    });
+  });
+
   describe("withRetry", () => {
     beforeEach(() => {
       vi.useFakeTimers();

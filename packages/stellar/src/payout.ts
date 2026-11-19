@@ -17,6 +17,7 @@ import {
   type RetryOptions,
 } from "./client";
 import { MAX_OPS_PER_TX, PAYOUT_BATCH_DELAY_MS } from "./constants";
+import { warn } from "./logger";
 import {
   buildSequenceKeyPrefix,
   reserveSequence,
@@ -76,7 +77,7 @@ export async function submitBatchPayout(
     if (options.onInvalidRecipient) {
       options.onInvalidRecipient(recipient, reason);
     } else {
-      console.warn("Skipping invalid payout recipient", { recipient, reason });
+      warn("Skipping invalid payout recipient", { recipient, reason });
     }
 
     return false;

@@ -1,11 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   fetchDepositEvents,
   generateDepositMemo,
   getDepositConfirmationCount,
   validateDepositMemo,
 } from "./deposit";
+import { setLogger } from "./logger";
 import * as client from "./client";
+
+const mocks = vi.hoisted(() => ({
+  warn: vi.fn(),
+}));
 
 vi.mock("./client", () => ({
   getRpcServer: vi.fn(),
@@ -13,6 +18,15 @@ vi.mock("./client", () => ({
   getNetworkConfig: vi.fn(),
   withRetry: vi.fn((fn) => fn()),
 }));
+
+beforeEach(() => {
+  mocks.warn.mockReset();
+  setLogger({ warn: mocks.warn });
+});
+
+afterEach(() => {
+  setLogger(undefined);
+});
 
 describe("deposit memo generation", () => {
   it("creates unique Stellar-compatible text memos", () => {
@@ -164,11 +178,14 @@ describe("getDepositConfirmationCount", () => {
     };
 
     vi.mocked(client.getRpcServer).mockReturnValue(mockRpc as any);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const confirmations = await getDepositConfirmationCount("abc123", 950, "testnet");
 
     expect(confirmations).toBe(0);
+    expect(mocks.warn).toHaveBeenCalledWith(
+      "Error checking deposit confirmations for abc123:",
+      expect.any(Error)
+    );
   });
 
   it("returns 0 when current ledger is less than tx ledger", async () => {
