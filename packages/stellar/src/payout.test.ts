@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setLogger } from "./logger";
 import type { SequenceStore } from "./sequence";
 
 const mocks = vi.hoisted(() => {
@@ -6,6 +7,7 @@ const mocks = vi.hoisted(() => {
   const loadAccountMock = vi.fn();
   const paymentMock = vi.fn((operation) => operation);
   const memoTextMock = vi.fn((value: string) => value);
+  const loggerWarnMock = vi.fn();
 
   class MockAccount {
     constructor(
@@ -56,6 +58,7 @@ const mocks = vi.hoisted(() => {
     MockAccount,
     MockTransactionBuilder,
     loadAccountMock,
+    loggerWarnMock,
     memoTextMock,
     paymentMock,
     submitTransactionMock,
@@ -132,10 +135,16 @@ describe("submitBatchPayout", () => {
     mocks.MockTransactionBuilder.sourceSequences = [];
     mocks.MockTransactionBuilder.operationCounts = [];
     vi.clearAllMocks();
+    setLogger({ warn: mocks.loggerWarnMock });
     mocks.loadAccountMock.mockResolvedValue(new mocks.MockAccount("GTESTPUBLICKEY", "100"));
     mocks.submitTransactionMock.mockImplementation(async () => ({
       hash: `tx-${mocks.submitTransactionMock.mock.calls.length}`,
     }));
+  });
+
+  afterEach(() => {
+    setLogger(undefined);
+    vi.restoreAllMocks();
   });
 
   it("submits a one-recipient payload as one transaction with one operation", async () => {
@@ -251,6 +260,7 @@ describe("submitBatchPayout", () => {
   });
 
   it("skips recipients with bad amounts, logs clearly, and continues the batch", async () => {
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const onInvalidRecipient = vi.fn();
     const valid = { address: "GVALID", amount: "2.5000000" };
     const invalid = { address: "GINVALID", amount: "-1.0000000" };
@@ -267,8 +277,36 @@ describe("submitBatchPayout", () => {
       invalid,
       "amount must be a positive Stellar amount with up to 7 decimal places"
     );
+    expect(mocks.loggerWarnMock).not.toHaveBeenCalled();
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
     expect(mocks.paymentMock).toHaveBeenCalledTimes(1);
     expect(mocks.submitTransactionMock).toHaveBeenCalledTimes(1);
+    expect(results).toEqual([
+      {
+        txHash: "tx-1",
+        recipients: [valid],
+        success: true,
+      },
+    ]);
+  });
+
+  it("logs skipped invalid recipients through the logger when no callback is supplied", async () => {
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const valid = { address: "GVALID", amount: "2.5000000" };
+    const invalid = { address: "", amount: "1.0000000" };
+
+    const results = await submitBatchPayout(
+      [invalid, valid],
+      "SSECRET",
+      "challenge-default-log",
+      "testnet"
+    );
+
+    expect(mocks.loggerWarnMock).toHaveBeenCalledWith("Skipping invalid payout recipient", {
+      recipient: invalid,
+      reason: "missing address",
+    });
+    expect(consoleWarnSpy).not.toHaveBeenCalled();
     expect(results).toEqual([
       {
         txHash: "tx-1",

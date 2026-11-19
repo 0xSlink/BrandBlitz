@@ -52,11 +52,16 @@ function isRetryableError(err: unknown, retryableStatusCodes: number[]): boolean
     return true;
   }
 
+  if ((err as any)?.code === "ETIMEDOUT") {
+    return true;
+  }
+
   const message = String((err as any)?.message ?? "").toLowerCase();
   return (
     message.includes("econnrefused") ||
     message.includes("econnreset") ||
     message.includes("enotfound") ||
+    message.includes("etimedout") ||
     message.includes("timeout") ||
     message.includes("timed out") ||
     message.includes("networkconnection")
@@ -149,18 +154,44 @@ const sharedHttpAgent = new http.Agent({
   maxFreeSockets: Math.ceil(maxSockets / 4),
 });
 
+interface HorizonAxiosDefaults {
+  httpsAgent?: unknown;
+  httpAgent?: unknown;
+}
+
+function getHorizonAxiosDefaults(): HorizonAxiosDefaults | undefined {
+  return (Horizon as unknown as { AxiosClient?: { defaults?: HorizonAxiosDefaults } }).AxiosClient
+    ?.defaults;
+}
+
 // Wire the agent into Horizon's shared axios client when the SDK exposes it so
 // every Horizon.Server instance created in this process reuses the connection
 // pool. Stellar SDK versions differ on whether this singleton is public.
-if (Horizon.AxiosClient?.defaults) {
-  Horizon.AxiosClient.defaults.httpsAgent = sharedAgent;
-  Horizon.AxiosClient.defaults.httpAgent = sharedHttpAgent;
+const horizonAxiosDefaults = getHorizonAxiosDefaults();
+if (horizonAxiosDefaults) {
+  horizonAxiosDefaults.httpsAgent = sharedAgent;
+  horizonAxiosDefaults.httpAgent = sharedHttpAgent;
 }
 
-/** Call on process shutdown to drain in-flight requests and close sockets. */
+/**
+ * Drain in-flight requests and close the shared agent sockets.
+ *
+ * Only call this once, at true process shutdown. Destroying the agents makes
+ * them unusable, so servers created before this call keep stale references;
+ * Horizon's shared axios defaults are cleared here so servers created
+ * afterwards do not reuse the destroyed agents. Calling this during any
+ * earlier shutdown window, or more than once, cannot revive already-created
+ * clients.
+ */
 export function drainSharedAgent(): void {
   sharedAgent.destroy();
   sharedHttpAgent.destroy();
+
+  const defaults = getHorizonAxiosDefaults();
+  if (defaults) {
+    defaults.httpsAgent = undefined;
+    defaults.httpAgent = undefined;
+  }
 }
 
 export function getHorizonServer(network: NetworkName = "testnet"): Horizon.Server {

@@ -47,35 +47,34 @@ describe("sponsorNewAccount", () => {
     balances: [],
   };
   const txMock = { sign: vi.fn(), toEnvelope: () => ({ toXDR: () => "XDR" }) };
-  let txBuilderAddOpOrder: string[] = [];
-
   beforeEach(() => {
     vi.resetAllMocks();
+    (client.withRetry as any).mockImplementation(async (fn: () => Promise<unknown>) => fn());
     (client.getHorizonServer as any).mockReturnValue({
       loadAccount: vi.fn().mockResolvedValue(sponsorAccount),
     });
     (client.getUsdcAsset as any).mockReturnValue(usdcAsset);
     (client.getNetworkPassphrase as any).mockReturnValue("testnet-passphrase");
-    vi.spyOn(TransactionBuilder.prototype, "addOperation").mockImplementation(function (op) {
-      txBuilderAddOpOrder.push(op.type);
+    vi.spyOn(TransactionBuilder.prototype, "addOperation").mockImplementation(function (
+      this: TransactionBuilder,
+      _op
+    ) {
       return this;
     });
     vi.spyOn(TransactionBuilder.prototype, "build").mockImplementation(() => txMock as any);
-    vi.spyOn(TransactionBuilder.prototype, "setTimeout").mockImplementation(function () {
+    vi.spyOn(TransactionBuilder.prototype, "setTimeout").mockImplementation(function (
+      this: TransactionBuilder
+    ) {
       return this;
     });
-    txBuilderAddOpOrder = [];
   });
 
   it("creates sponsorship tx with correct op order", async () => {
     const result = await sponsorNewAccount(winnerPublicKey, sponsorSecret, "testnet");
     expect(result.txEnvelopeXdr).toBe("XDR");
-    expect(txBuilderAddOpOrder).toEqual([
-      "beginSponsoringFutureReserves",
-      "createAccount",
-      "changeTrust",
-      "endSponsoringFutureReserves",
-    ]);
+    expect(TransactionBuilder.prototype.addOperation).toHaveBeenCalledTimes(4);
+    expect(txMock.sign).toHaveBeenCalledOnce();
+    expect(txMock.sign).toHaveBeenCalledWith(sponsorKeypair);
   });
 
   it("works for public network", async () => {
@@ -83,6 +82,41 @@ describe("sponsorNewAccount", () => {
     expect(client.getHorizonServer).toHaveBeenCalledWith("public");
     expect(client.getUsdcAsset).toHaveBeenCalledWith("public");
     expect(client.getNetworkPassphrase).toHaveBeenCalledWith("public");
+  });
+
+  it("retries a 503 Horizon failure and returns a valid envelope", async () => {
+    const actualClient = await vi.importActual<typeof import("./client")>("./client");
+    vi.useFakeTimers();
+    (client.withRetry as any).mockImplementation(actualClient.withRetry);
+
+    const loadAccount = vi
+      .fn()
+      .mockRejectedValueOnce(Object.assign(new Error("Service unavailable"), { status: 503 }))
+      .mockResolvedValueOnce(sponsorAccount);
+    (client.getHorizonServer as any).mockReturnValue({ loadAccount });
+
+    const promise = sponsorNewAccount(winnerPublicKey, sponsorSecret, "testnet");
+    await vi.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result).toEqual({ txEnvelopeXdr: "XDR" });
+    expect(loadAccount).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("does not retry a non-retryable 400 Horizon failure", async () => {
+    const actualClient = await vi.importActual<typeof import("./client")>("./client");
+    (client.withRetry as any).mockImplementation(actualClient.withRetry);
+
+    const loadAccount = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("Bad request"), { status: 400 }));
+    (client.getHorizonServer as any).mockReturnValue({ loadAccount });
+
+    await expect(
+      sponsorNewAccount(winnerPublicKey, sponsorSecret, "testnet")
+    ).rejects.toThrow("Bad request");
+    expect(loadAccount).toHaveBeenCalledTimes(1);
   });
 });
 

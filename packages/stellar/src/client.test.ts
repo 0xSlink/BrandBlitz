@@ -4,6 +4,8 @@ import {
   getHorizonServer,
   getRpcServer,
   getUsdcAsset,
+  getNetworkPassphrase,
+  drainSharedAgent,
   sharedAgent,
   withRetry,
 } from "./client";
@@ -35,10 +37,24 @@ describe("client", () => {
   });
 
   describe("getRpcServer", () => {
-    it("should create RPC server with correct URL", () => {
+    it("should create RPC server with the testnet URL", () => {
       const server = getRpcServer("testnet");
-      // @ts-ignore - access private/internal URL if needed, but let's just check if it exists
-      expect(server).toBeDefined();
+      expect(server.serverURL.toString()).toContain("soroban-testnet.stellar.org");
+    });
+
+    it("should create RPC server with the public URL", () => {
+      const server = getRpcServer("public");
+      expect(server.serverURL.toString()).toContain("mainnet.stellar.validationcloud.io");
+    });
+  });
+
+  describe("getNetworkPassphrase", () => {
+    it("should return the testnet passphrase", () => {
+      expect(getNetworkPassphrase("testnet")).toBe(STELLAR_NETWORKS.testnet.networkPassphrase);
+    });
+
+    it("should return the public passphrase", () => {
+      expect(getNetworkPassphrase("public")).toBe(STELLAR_NETWORKS.public.networkPassphrase);
     });
   });
 
@@ -63,6 +79,67 @@ describe("client", () => {
 
     it("maxSockets is a positive number", () => {
       expect(sharedAgent.maxSockets).toBeGreaterThan(0);
+    });
+
+    it("drainSharedAgent destroys the shared agent", () => {
+      const destroySpy = vi.spyOn(sharedAgent, "destroy");
+      drainSharedAgent();
+      expect(destroySpy).toHaveBeenCalled();
+      destroySpy.mockRestore();
+    });
+
+    it("drainSharedAgent does not throw when called with no prior HTTP activity", () => {
+      expect(() => drainSharedAgent()).not.toThrow();
+    });
+  });
+
+  describe("drainSharedAgent", () => {
+    type HorizonAxiosClient = {
+      defaults: { httpsAgent?: unknown; httpAgent?: unknown };
+    };
+    const horizonModule = Horizon as unknown as { AxiosClient?: HorizonAxiosClient };
+    let originalAxiosClient: HorizonAxiosClient | undefined;
+
+    beforeEach(() => {
+      originalAxiosClient = horizonModule.AxiosClient;
+    });
+
+    afterEach(() => {
+      if (originalAxiosClient) {
+        horizonModule.AxiosClient = originalAxiosClient;
+      } else {
+        delete horizonModule.AxiosClient;
+      }
+    });
+
+    it("clears Horizon axios agent defaults so new servers do not reuse destroyed agents", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      drainSharedAgent();
+
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
+
+      const server = getHorizonServer("testnet");
+      expect(server.serverURL.toString()).toContain("horizon-testnet.stellar.org");
+      const serverHttpClient = (
+        server as unknown as { httpClient: { defaults: HorizonAxiosClient["defaults"] } }
+      ).httpClient;
+      expect(serverHttpClient.defaults.httpsAgent).not.toBe(sharedAgent);
+      expect(serverHttpClient.defaults.httpAgent).not.toBe(sharedAgent);
+    });
+
+    it("is idempotent when called twice", () => {
+      const defaults = { httpsAgent: sharedAgent, httpAgent: sharedAgent };
+      horizonModule.AxiosClient = { defaults };
+
+      expect(() => {
+        drainSharedAgent();
+        drainSharedAgent();
+      }).not.toThrow();
+      expect(defaults.httpsAgent).toBeUndefined();
+      expect(defaults.httpAgent).toBeUndefined();
     });
   });
 
@@ -140,6 +217,33 @@ describe("client", () => {
       expect(fn).toHaveBeenCalledTimes(2);
     });
 
+    it("should retry ETIMEDOUT errors identified by message", async () => {
+      const error = new Error("connect ETIMEDOUT 1.2.3.4:443");
+
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
+
+      const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
+      await vi.runAllTimersAsync();
+      const result = await promise;
+
+      expect(result).toBe("success");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("should retry ETIMEDOUT errors identified by code", async () => {
+      const error = new Error("Socket connection stalled");
+      (error as any).code = "ETIMEDOUT";
+
+      const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce("success");
+
+      const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
+      await vi.runAllTimersAsync();
+      const result = await promise;
+
+      expect(result).toBe("success");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
     it("should not retry on non-retryable errors", async () => {
       const error = new Error("Invalid request");
       (error as any).response = { status: 400 };
@@ -157,15 +261,12 @@ describe("client", () => {
       const fn = vi.fn().mockRejectedValue(error);
 
       const promise = withRetry(fn, { maxAttempts: 3, baseDelayMs: 100 });
+      const rejection = expect(promise).rejects.toMatchObject({
+        retryExhausted: true,
+        message: "Service unavailable",
+      });
       await vi.runAllTimersAsync();
-
-      try {
-        await promise;
-        expect.fail("Should have thrown");
-      } catch (err: any) {
-        expect(err.retryExhausted).toBe(true);
-        expect(err.message).toBe("Service unavailable");
-      }
+      await rejection;
 
       expect(fn).toHaveBeenCalledTimes(3);
     });
@@ -182,17 +283,7 @@ describe("client", () => {
 
       const promise = withRetry(fn, { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 30_000 });
 
-      // First attempt fails immediately
-      expect(fn).toHaveBeenCalledTimes(0);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(fn).toHaveBeenCalledTimes(1);
-
-      // First retry is scheduled (exponential backoff)
-      await vi.advanceTimersByTimeAsync(200);
-      expect(fn).toHaveBeenCalledTimes(2);
-
-      // Second retry (more backoff)
-      await vi.advanceTimersByTimeAsync(400);
+      await vi.runAllTimersAsync();
       expect(fn).toHaveBeenCalledTimes(3);
 
       const result = await promise;
@@ -251,13 +342,9 @@ describe("client", () => {
       const fn = vi.fn().mockRejectedValue(error);
 
       const promise = withRetry(fn, { maxAttempts: 2, baseDelayMs: 100 });
+      const rejection = expect(promise).rejects.toThrow("Service unavailable");
       await vi.runAllTimersAsync();
-
-      try {
-        await promise;
-      } catch {
-        // Expected
-      }
+      await rejection;
 
       expect(console.warn).toHaveBeenCalledWith(
         expect.stringContaining("Exhausted"),

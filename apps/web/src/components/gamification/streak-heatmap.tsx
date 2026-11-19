@@ -79,7 +79,8 @@ export function StreakHeatmap({ activity }: StreakHeatmapProps) {
 
   const formatDate = (dateStr: string): string => {
     const date = new Date(dateStr + "T00:00:00Z");
-    return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const locale = typeof navigator !== "undefined" ? navigator.language : "en-US";
+    return date.toLocaleDateString(locale, { month: "short", day: "numeric" });
   };
 
   const weeks = getCellGroupsByWeek();

@@ -7,7 +7,13 @@ import {
   MuxedAccount,
   xdr,
 } from "@stellar/stellar-sdk";
-import { getHorizonServer, getUsdcAsset, getNetworkPassphrase, type NetworkName } from "./client";
+import {
+  getHorizonServer,
+  getUsdcAsset,
+  getNetworkPassphrase,
+  withRetry,
+  type NetworkName,
+} from "./client";
 
 /**
  * Create a muxed account address from a base account public key and a user ID.
@@ -37,7 +43,10 @@ export async function sponsorNewAccount(
   const usdc = getUsdcAsset(network);
   const passphrase = getNetworkPassphrase(network);
   const sponsorKeypair = Keypair.fromSecret(sponsorSecret);
-  const sponsorAccount = await horizon.loadAccount(sponsorKeypair.publicKey());
+  const sponsorAccount = await withRetry(
+    () => horizon.loadAccount(sponsorKeypair.publicKey()),
+    { maxAttempts: 5, baseDelayMs: 250, maxDelayMs: 30_000 }
+  );
 
   const tx = new TransactionBuilder(sponsorAccount, {
     fee: BASE_FEE,
