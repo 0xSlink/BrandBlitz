@@ -6,7 +6,6 @@ import {
   Operation,
   SorobanDataBuilder,
   TransactionBuilder,
-  Asset,
   nativeToScVal,
   scValToNative,
   xdr,
@@ -25,6 +24,26 @@ export interface EscrowConfig {
   horizonUrl: string;
   sorobanUrl: string;
   networkPassphrase: string;
+}
+
+/**
+ * Builds the ScVal key for a unit variant of the contract's `#[contracttype] enum DataKey`.
+ * soroban-sdk encodes unit variants as a one-element vector holding the variant name.
+ */
+function dataKeyUnitVariant(name: string): xdr.ScVal {
+  return xdr.ScVal.scvVec([xdr.ScVal.scvSymbol(name)]);
+}
+
+/**
+ * Turns a failed transaction simulation into an error that names the operation and,
+ * for authorization failures, says which party did not authorise the call.
+ */
+function explainSimulationError(operation: string, error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/require_auth|authoriz|authoris|\bauth\b/i.test(message)) {
+    return new Error(`${operation} rejected: the admin did not authorise this call (${message})`);
+  }
+  return new Error(`${operation} simulation failed: ${message}`);
 }
 
 /**
@@ -49,6 +68,9 @@ export class EscrowClient {
   /**
    * Initialize the escrow contract for a challenge.
    * Called once per challenge to set up the contract instance.
+   *
+   * Authorization: the contract's `initialize` does not call `require_auth`, so no
+   * authorization entry is attached. The signer only pays the fee.
    *
    * @param admin - BrandBlitz hot-wallet address (authorized to settle/refund)
    * @param usdcTokenAddress - USDC SAC contract address on this network
@@ -99,6 +121,9 @@ export class EscrowClient {
   /**
    * Deposit USDC into the escrow contract.
    * Called by the brand to fund the prize pool.
+   *
+   * Authorization: the depositor must sign (`depositor.require_auth()` on the contract),
+   * so an explicit address credential is attached.
    *
    * @param depositor - Brand address (must have approved USDC for contract)
    * @param amountStroops - Amount in stroops (1 USDC = 10^7 stroops)
@@ -173,6 +198,11 @@ export class EscrowClient {
    * Settle the escrow by distributing USDC to winners.
    * Called by the backend after challenge ends to pay out winners.
    *
+   * Authorization: the contract calls `admin.require_auth()`. The transaction is simulated
+   * and prepared before signing, so the auth entry for the admin is filled in from the
+   * simulation. If the admin does not authorise the call, this throws a readable error
+   * instead of the generic "Settle failed".
+   *
    * @param recipients - Array of (address, amountStroops) pairs
    * @param signerSecret - Hot-wallet secret key for signing
    */
@@ -198,8 +228,16 @@ export class EscrowClient {
       .setTimeout(300)
       .build();
 
-    tx.sign(signer);
-    const result = await withRetry(() => this.sorobanServer.sendTransaction(tx), {
+    // Simulate first: prepareTransaction fills in the admin's authorization entry and the
+    // resource footprint. Not retried, because a simulation failure is deterministic.
+    const prepared = await this.sorobanServer
+      .prepareTransaction(tx)
+      .catch((e: unknown) => {
+        throw explainSimulationError("Settle", e);
+      });
+
+    prepared.sign(signer);
+    const result = await withRetry(() => this.sorobanServer.sendTransaction(prepared), {
       maxAttempts: 5,
       baseDelayMs: 250,
       maxDelayMs: 30_000,
@@ -215,6 +253,9 @@ export class EscrowClient {
   /**
    * Refund the full balance back to the depositor.
    * Called by admin for cancelled challenges.
+   *
+   * Authorization: the contract calls `admin.require_auth()`. This is not yet prepared
+   * by simulation, so it has the same limitation `settle` had before (tracked separately).
    *
    * @param signerSecret - Admin hot-wallet secret key for signing
    */
@@ -250,64 +291,68 @@ export class EscrowClient {
   }
 
   /**
-   * View: Get the current escrowed balance.
+   * Reads a `DataKey` value. The contract writes these to instance storage, which is
+   * held inside the contract-instance ledger entry rather than under its own key. A
+   * per-key lookup therefore never finds them. Returns null when the key is unset.
    */
-  async getBalance(): Promise<bigint> {
-    const result = await withRetry(
+  private async readInstanceValue(variant: string): Promise<xdr.ScVal | null> {
+    const instance = await withRetry(
       () =>
         this.sorobanServer.getContractData(
           this.contract.address().contractId(),
-          xdr.ScVal.scValTypeSymbol(Buffer.from("balance"))
+          xdr.ScVal.scvLedgerKeyContractInstance()
         ),
       { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 5_000 }
     );
 
-    if (!result) {
+    if (!instance) {
+      return null;
+    }
+
+    const storage = instance.val.instance().storage();
+    if (!storage) {
+      return null;
+    }
+
+    const wanted = dataKeyUnitVariant(variant).toXDR("base64");
+    const entry = storage.find((e) => e.key().toXDR("base64") === wanted);
+    return entry ? entry.val() : null;
+  }
+
+  /**
+   * View: Get the current escrowed balance.
+   */
+  async getBalance(): Promise<bigint> {
+    const value = await this.readInstanceValue("Balance");
+    if (!value) {
       return 0n;
     }
 
-    const balance = scValToNative(result.val);
-    return BigInt(balance as number);
+    return BigInt(scValToNative(value) as number | bigint);
   }
 
   /**
    * View: Check if the escrow has been settled or refunded.
    */
   async isSettled(): Promise<boolean> {
-    const result = await withRetry(
-      () =>
-        this.sorobanServer.getContractData(
-          this.contract.address().contractId(),
-          xdr.ScVal.scValTypeSymbol(Buffer.from("settled"))
-        ),
-      { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 5_000 }
-    );
-
-    if (!result) {
+    const value = await this.readInstanceValue("Settled");
+    if (!value) {
       return false;
     }
 
-    return scValToNative(result.val) as boolean;
+    return scValToNative(value) as boolean;
   }
 
   /**
    * View: Get the challenge memo string (returns empty string if uninitialized).
    */
   async getMemo(): Promise<string> {
-    const result = await withRetry(
-      () =>
-        this.sorobanServer.getContractData(
-          this.contract.address().contractId(),
-          xdr.ScVal.scValTypeSymbol(Buffer.from("memo"))
-        ),
-      { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 5_000 }
-    );
-
-    if (!result) {
+    const value = await this.readInstanceValue("Memo");
+    if (!value) {
       return "";
     }
 
-    return scValToNative(result.val) as string;
+    return scValToNative(value) as string;
   }
 
   /**
@@ -335,15 +380,10 @@ export class EscrowClient {
 
     // Build operation based on type
     if (operation === "withdraw") {
-      // Withdraw amount from escrow back to initiator
-      const { amount } = operationData as { amount: bigint };
-      tx.addOperation(
-        Operation.payment({
-          destination: signer.publicKey(),
-          asset: new Asset("USDC", "GA5ZSEJYB37JRC5AVCIA5MOP4IYCGWTR5JUDLBLUKE4T2EP5GQWFQH2"),
-          amount: (Number(amount) / 1e7).toString(),
-        })
-      );
+      // The escrow contract has no withdraw entrypoint. The previous classic self-payment
+      // never touched escrowed funds and used the public network's USDC issuer on every
+      // network. Fail closed until the contract gains a real withdraw entrypoint.
+      throw new Error("withdraw is not supported: the escrow contract has no withdraw entrypoint");
     } else if (operation === "close_escrow") {
       // Close escrow account and return reserves
       tx.addOperation(
@@ -367,6 +407,8 @@ export class EscrowClient {
           auth: [],
         })
       );
+    } else {
+      throw new Error(`Unsupported admin operation: ${String(operation)}`);
     }
 
     const built = tx.setTimeout(300).build();
