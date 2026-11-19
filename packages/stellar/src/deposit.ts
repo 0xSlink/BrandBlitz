@@ -36,11 +36,15 @@ export function generateDepositMemo(): string {
 }
 
 export function validateDepositMemo(memo: string | null): DepositMemoValidation {
-  if (!memo?.trim()) return { valid: false, reason: "missing" };
-  if (Buffer.byteLength(memo, "utf8") > 28 || /[\u0000-\u001f\u007f]/.test(memo)) {
+  const trimmedMemo = memo?.trim();
+  if (!trimmedMemo) return { valid: false, reason: "missing" };
+  if (/[\u0000-\u001f\u007f]/.test(trimmedMemo)) {
     return { valid: false, reason: "invalid_format" };
   }
-  return { valid: true, memo };
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmedMemo)) {
+    return { valid: true, memo: trimmedMemo };
+  }
+  return { valid: false, reason: "invalid_format" };
 }
 
 /**
